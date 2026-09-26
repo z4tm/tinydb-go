@@ -13,10 +13,9 @@ import (
 )
 
 const (
-	pageSize = 4096
-	maxKey   = 255
-	maxVal   = 1 << 20
-	magic    = 0x54444231
+	maxKey = 255
+	maxVal = 1 << 20
+	magic  = 0x54444231
 )
 
 type DB struct {
@@ -47,6 +46,10 @@ func Open(path string) (*DB, error) {
 	if err := db.recover(); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("recover: %w", err)
+	}
+	if err := f.Truncate(int64(db.size)); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("truncate: %w", err)
 	}
 
 	return db, nil
@@ -115,32 +118,40 @@ func (db *DB) readRecord(offset uint64) (*record, uint64, error) {
 	keyLen := binary.LittleEndian.Uint16(header[0:2])
 	valLen := binary.LittleEndian.Uint32(header[2:6])
 	crc := binary.LittleEndian.Uint32(header[6:10])
+	deleted := valLen == 0xFFFFFFFF
 
-	if keyLen > maxKey || valLen > maxVal {
+	if keyLen == 0 || keyLen > maxKey || (!deleted && valLen > maxVal) {
 		return nil, 0, errPartial
 	}
 
-	total := uint64(10) + uint64(keyLen) + uint64(valLen) + 4
-	if offset+total > uint64(0xFFFFFFFFFFFFFFFF) {
+	payloadLen := uint64(keyLen)
+	if !deleted {
+		payloadLen += uint64(valLen)
+	}
+	if payloadLen > ^uint64(0)-14 || offset > ^uint64(0)-(payloadLen+14) {
 		return nil, 0, errPartial
 	}
+	total := payloadLen + 14
 
-	data := make([]byte, total-10)
+	data := make([]byte, payloadLen+4)
 	n2, err := db.file.ReadAt(data, int64(offset+10))
 	if err != nil && err != io.EOF {
 		return nil, 0, err
 	}
-	if uint64(n2) < total-10 {
+	if uint64(n2) < payloadLen+4 {
 		return nil, 0, errPartial
 	}
 
 	key := string(data[:keyLen])
-	val := data[keyLen : keyLen+valLen]
-	storedCrc := binary.LittleEndian.Uint32(data[keyLen+valLen : keyLen+valLen+4])
+	var val []byte
+	if !deleted {
+		val = append([]byte(nil), data[keyLen:payloadLen]...)
+	}
+	storedCrc := binary.LittleEndian.Uint32(data[payloadLen : payloadLen+4])
 
 	h := crc32.NewIEEE()
 	h.Write(header[0:6])
-	h.Write(data[:keyLen+valLen])
+	h.Write(data[:payloadLen])
 	if h.Sum32() != crc || storedCrc != crc {
 		return nil, 0, errPartial
 	}
@@ -149,6 +160,9 @@ func (db *DB) readRecord(offset uint64) (*record, uint64, error) {
 }
 
 func (db *DB) writeRecord(key string, val []byte) (uint64, error) {
+	if len(key) == 0 {
+		return 0, errors.New("key cannot be empty")
+	}
 	if len(key) > maxKey {
 		return 0, fmt.Errorf("key too long (max %d)", maxKey)
 	}
@@ -185,6 +199,9 @@ func (db *DB) Set(key string, val []byte) error {
 	if err != nil {
 		return err
 	}
+	if err := db.file.Sync(); err != nil {
+		return err
+	}
 	db.index[key] = offset
 	return nil
 }
@@ -202,6 +219,12 @@ func (db *DB) Get(key string) ([]byte, error) {
 }
 
 func (db *DB) Delete(key string) error {
+	if len(key) == 0 {
+		return errors.New("key cannot be empty")
+	}
+	if len(key) > maxKey {
+		return fmt.Errorf("key too long (max %d)", maxKey)
+	}
 	header := make([]byte, 10)
 	binary.LittleEndian.PutUint16(header[0:2], uint16(len(key)))
 	binary.LittleEndian.PutUint32(header[2:6], 0xFFFFFFFF)
@@ -220,6 +243,9 @@ func (db *DB) Delete(key string) error {
 		return err
 	}
 	db.size += uint64(len(buf))
+	if err := db.file.Sync(); err != nil {
+		return err
+	}
 	delete(db.index, key)
 	return nil
 }
